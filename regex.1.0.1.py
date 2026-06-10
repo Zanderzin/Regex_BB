@@ -2,7 +2,7 @@
 PDF / TXT Document Searcher
 ============================
 Aplicação desktop para busca de documentos em pastas locais.
-Modo atual: arquivos TXT (fácil de trocar para PDF).
+Modo atual: arquivos TXT (altere TARGET_EXT para ".pdf" quando quiser).
 
 Requisitos:
     pip install customtkinter
@@ -13,6 +13,7 @@ Uso:
 
 import os
 import re
+import queue
 import zipfile
 import threading
 import subprocess
@@ -26,9 +27,9 @@ from typing import Optional
 import customtkinter as ctk
 
 # ──────────────────────────────────────────────
-# Modo de busca — troque para ".pdf" quando quiser
+# Modo de busca
 # ──────────────────────────────────────────────
-TARGET_EXT = ".txt"   # <- altere para ".pdf" para voltar ao modo PDF
+TARGET_EXT = ".txt"   # <- altere para ".pdf" quando quiser
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -63,7 +64,7 @@ class IndexEntry:
                  tipo: str = "TXT", zip_path: Optional[str] = None):
         self.nome = nome
         self.caminho = caminho
-        self.tipo = tipo          # "TXT" / "PDF" / "ZIP"
+        self.tipo = tipo
         self.zip_path = zip_path
 
     def full_path(self) -> str:
@@ -73,9 +74,14 @@ class IndexEntry:
 
 
 # ══════════════════════════════════════════════
-#  Motor de indexação
+#  Motor de indexação  (roda em worker thread)
 # ══════════════════════════════════════════════
 class IndexEngine:
+    """
+    Toda a lógica pesada (I/O de disco, regex, zip) roda aqui.
+    Nunca toca em widgets Tkinter — comunica via callbacks que
+    a UI agenda com .after().
+    """
     _NUM_RE = re.compile(r"\d+")
 
     def __init__(self):
@@ -88,6 +94,7 @@ class IndexEngine:
         self.total_files = 0
         self.total_codes = 0
 
+    # ── Varredura ─────────────────────────────
     def scan(self, root: str, progress_cb=None, status_cb=None) -> None:
         self.reset()
         all_items = list(self._walk_items(root))
@@ -96,7 +103,6 @@ class IndexEngine:
         for idx, (item_type, filepath) in enumerate(all_items):
             if progress_cb:
                 progress_cb(idx + 1, total)
-
             if item_type == "file":
                 self._index_file(filepath)
             elif item_type == "zip":
@@ -125,8 +131,7 @@ class IndexEngine:
         nome = os.path.basename(filepath)
         pasta = os.path.dirname(filepath)
         tipo = TARGET_EXT.lstrip(".").upper()
-        entry = IndexEntry(nome=nome, caminho=pasta, tipo=tipo)
-        self._add_to_index(nome, entry)
+        self._add_to_index(nome, IndexEntry(nome=nome, caminho=pasta, tipo=tipo))
         self.total_files += 1
 
     def _index_zip(self, zip_filepath: str) -> None:
@@ -152,6 +157,7 @@ class IndexEngine:
         for code in self._NUM_RE.findall(stem):
             self.index[code].append(entry)
 
+    # ── Pesquisa (roda na worker thread) ──────
     def search(self, query: str) -> list[IndexEntry]:
         q = query.strip()
         if not q or not q.isdigit():
@@ -173,6 +179,7 @@ class ResultRow(ctk.CTkFrame):
         self.bind("<Enter>", lambda _: self.configure(fg_color=COLORS["bg_hover"]))
         self.bind("<Leave>", lambda _: self.configure(fg_color=self._bg))
 
+        # Badge tipo
         badge_color = COLORS["zip_badge"] if entry.tipo == "ZIP" else COLORS["file_badge"]
         badge = ctk.CTkLabel(
             self, text=f" {entry.tipo} ",
@@ -183,6 +190,7 @@ class ResultRow(ctk.CTkFrame):
         )
         badge.pack(side="left", padx=(10, 6), pady=8)
 
+        # Nome do arquivo
         name_lbl = ctk.CTkLabel(
             self, text=entry.nome,
             text_color=COLORS["text_primary"],
@@ -191,10 +199,9 @@ class ResultRow(ctk.CTkFrame):
         )
         name_lbl.pack(side="left", padx=(0, 8), pady=8, fill="x", expand=True)
 
-        # Botao abrir pasta — abre o gerenciador de arquivos com o arquivo selecionado
+        # Botão abrir pasta no gerenciador
         btn_folder = ctk.CTkButton(
-            self,
-            text="📁",
+            self, text="📁",
             width=30, height=26,
             fg_color=COLORS["bg_hover"],
             hover_color=COLORS["accent_dim"],
@@ -205,6 +212,7 @@ class ResultRow(ctk.CTkFrame):
         )
         btn_folder.pack(side="right", padx=(0, 8))
 
+        # Caminho resumido
         path_text = (f"📦 {os.path.basename(entry.zip_path or '')}"
                      if entry.tipo == "ZIP"
                      else self._short_path(entry.caminho))
@@ -234,10 +242,21 @@ class ResultRow(ctk.CTkFrame):
 #  Janela principal
 # ══════════════════════════════════════════════
 class App(ctk.CTk):
+    """
+    UI roda na thread principal do Tkinter.
+    Toda operação pesada (scan, search) é despachada para
+    self._worker_thread via self._task_queue.
+    Resultados voltam para a UI via self.after() — thread-safe.
+    """
+
     def __init__(self):
         super().__init__()
         self.engine = IndexEngine()
         self._scanning = False
+        self._searching = False
+
+        # Fila de tarefas para o worker thread
+        self._task_queue: queue.Queue = queue.Queue()
 
         self.title("PDF Searcher")
         self.geometry("980x680")
@@ -247,6 +266,11 @@ class App(ctk.CTk):
 
         self._build_ui()
 
+        # Inicia o worker thread persistente
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+
     def _center(self):
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -254,13 +278,33 @@ class App(ctk.CTk):
         self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
     # ══════════════════════════════════════════
-    #  UI — tudo com PACK para evitar sobreposição
+    #  Worker thread persistente
+    #  Consome tarefas da fila e executa o backend
+    # ══════════════════════════════════════════
+    def _worker_loop(self):
+        """Roda em background; processa uma tarefa por vez."""
+        while True:
+            task, args = self._task_queue.get()
+            try:
+                task(*args)
+            except Exception as exc:
+                self.after(0, lambda e=exc: messagebox.showerror(
+                    "Erro interno", str(e)))
+            finally:
+                self._task_queue.task_done()
+
+    def _enqueue(self, task, *args):
+        """Envia uma tarefa para o worker thread."""
+        self._task_queue.put((task, args))
+
+    # ══════════════════════════════════════════
+    #  Construção da UI (thread principal)
     # ══════════════════════════════════════════
     def _build_ui(self):
         self._build_header()
         self._build_toolbar()
         self._build_search()
-        self._build_results()   # fill + expand
+        self._build_results()
         self._build_statusbar()
 
     # ── Header ────────────────────────────────
@@ -273,19 +317,16 @@ class App(ctk.CTk):
         ctk.CTkLabel(hdr, text="🔍",
                      font=ctk.CTkFont(size=24)
                      ).pack(side="left", padx=(16, 6), pady=10)
-
         ctk.CTkLabel(hdr, text="PDF Searcher",
                      font=ctk.CTkFont(size=18, weight="bold"),
                      text_color=COLORS["text_primary"]
                      ).pack(side="left", pady=10)
-
         ctk.CTkLabel(hdr,
                      text="Busca inteligente por códigos em documentos",
                      font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_secondary"]
                      ).pack(side="right", padx=20, pady=10)
 
-        # divisória
         ctk.CTkFrame(self, fg_color=COLORS["border"],
                      height=1, corner_radius=0).pack(fill="x", side="top")
 
@@ -296,7 +337,6 @@ class App(ctk.CTk):
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
 
-        # Botão selecionar pasta
         self.btn_select = ctk.CTkButton(
             bar,
             text="📂  Selecionar Pasta",
@@ -310,11 +350,9 @@ class App(ctk.CTk):
         )
         self.btn_select.pack(side="left", padx=(14, 10), pady=10)
 
-        # Divisória vertical
         ctk.CTkFrame(bar, fg_color=COLORS["border"], width=1,
                      corner_radius=0).pack(side="left", fill="y", pady=10, padx=4)
 
-        # Label do caminho
         self.lbl_folder = ctk.CTkLabel(
             bar,
             text="Nenhuma pasta selecionada",
@@ -324,7 +362,6 @@ class App(ctk.CTk):
         )
         self.lbl_folder.pack(side="left", padx=10, fill="x", expand=True)
 
-        # Barra de progresso
         self.progressbar = ctk.CTkProgressBar(
             bar, mode="determinate", height=6, width=160,
             fg_color=COLORS["bg_primary"],
@@ -333,7 +370,6 @@ class App(ctk.CTk):
         self.progressbar.set(0)
         self.progressbar.pack(side="right", padx=(0, 8))
 
-        # Stats
         self.lbl_stats = ctk.CTkLabel(
             bar, text="",
             text_color=COLORS["text_secondary"],
@@ -341,7 +377,6 @@ class App(ctk.CTk):
         )
         self.lbl_stats.pack(side="right", padx=(0, 12))
 
-        # divisória
         ctk.CTkFrame(self, fg_color=COLORS["border"],
                      height=1, corner_radius=0).pack(fill="x", side="top")
 
@@ -360,12 +395,11 @@ class App(ctk.CTk):
                      ).pack(side="left", padx=(14, 4))
 
         self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", self._on_search)
 
         self.entry_search = ctk.CTkEntry(
             card,
             textvariable=self._search_var,
-            placeholder_text="Digite um código numérico…",
+            placeholder_text="Digite um código numérico e pressione Enter ou clique em Buscar…",
             fg_color="transparent",
             border_width=0,
             text_color=COLORS["text_primary"],
@@ -374,18 +408,35 @@ class App(ctk.CTk):
             height=42,
         )
         self.entry_search.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        # Enter dispara a busca
+        self.entry_search.bind("<Return>", lambda _: self._trigger_search())
 
+        # Botão Buscar
+        self.btn_search = ctk.CTkButton(
+            card,
+            text="🔍  Buscar",
+            command=self._trigger_search,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            corner_radius=8,
+            height=32,
+            width=110,
+        )
+        self.btn_search.pack(side="right", padx=(0, 6))
+
+        # Botão limpar
         ctk.CTkButton(
-            card, text="✕", width=30, height=26,
+            card, text="✕", width=30, height=32,
             fg_color=COLORS["bg_hover"],
             hover_color=COLORS["error"],
             text_color=COLORS["text_secondary"],
             font=ctk.CTkFont(size=11),
             corner_radius=6,
             command=self._clear_search,
-        ).pack(side="right", padx=(0, 8))
+        ).pack(side="right", padx=(0, 4))
 
-        # contador
+        # Contador de resultados
         self.lbl_count = ctk.CTkLabel(
             outer, text="",
             text_color=COLORS["text_secondary"],
@@ -400,7 +451,6 @@ class App(ctk.CTk):
                               corner_radius=0)
         outer.pack(fill="both", expand=True, padx=16, pady=(6, 6))
 
-        # Cabeçalho
         thead = ctk.CTkFrame(outer, fg_color=COLORS["bg_secondary"],
                               corner_radius=8)
         thead.pack(fill="x", pady=(0, 2))
@@ -418,7 +468,6 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=10, weight="bold")
                      ).pack(side="right", padx=10, pady=5)
 
-        # Scroll
         self.scroll = ctk.CTkScrollableFrame(
             outer,
             fg_color=COLORS["bg_primary"],
@@ -447,13 +496,13 @@ class App(ctk.CTk):
 
         ext_label = TARGET_EXT.upper().lstrip(".")
         ctk.CTkLabel(
-            bar, text=f"Modo: {ext_label}  •  PDF Searcher v1.2",
+            bar, text=f"Modo: {ext_label}  •  PDF Searcher v1.3",
             text_color=COLORS["text_muted"],
             font=ctk.CTkFont(size=10),
         ).pack(side="right", padx=12)
 
     # ══════════════════════════════════════════
-    #  Lógica
+    #  Seleção de pasta — dispara scan no worker
     # ══════════════════════════════════════════
     def _select_folder(self):
         if self._scanning:
@@ -466,30 +515,30 @@ class App(ctk.CTk):
                                    text_color=COLORS["text_primary"])
         self._clear_search()
         self._placeholder("scanning")
-        self._start_scan(folder)
-
-    def _start_scan(self, folder: str):
         self._scanning = True
         self.btn_select.configure(state="disabled", text="⏳  Indexando…")
         self.progressbar.set(0)
         self.lbl_stats.configure(text="")
 
-        def worker():
-            self.engine.scan(
-                folder,
-                progress_cb=lambda c, t: self.after(
-                    0, lambda: self.progressbar.set(c / t if t else 0)),
-                status_cb=lambda m: self.after(
-                    0, lambda msg=m: self.lbl_status.configure(text=msg)),
-            )
-            self.after(0, self._scan_done)
+        # Despacha o scan para o worker thread
+        self._enqueue(self._do_scan, folder)
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _do_scan(self, folder: str):
+        """Executa no worker thread — sem tocar em widgets."""
+        def progress_cb(current, total):
+            pct = current / total if total else 0
+            self.after(0, lambda p=pct: self.progressbar.set(p))
+
+        def status_cb(msg):
+            self.after(0, lambda m=msg: self.lbl_status.configure(text=m))
+
+        self.engine.scan(folder, progress_cb=progress_cb, status_cb=status_cb)
+        self.after(0, self._scan_done)
 
     def _scan_done(self):
+        """Chamado de volta na thread principal via .after()."""
         self._scanning = False
-        self.btn_select.configure(state="normal",
-                                   text="📂  Selecionar Pasta")
+        self.btn_select.configure(state="normal", text="📂  Selecionar Pasta")
         self.progressbar.set(1)
         self.lbl_stats.configure(
             text=f"📄 {self.engine.total_files}  🔑 {self.engine.total_codes}",
@@ -497,31 +546,66 @@ class App(ctk.CTk):
         )
         self._placeholder("ready")
 
-    def _on_search(self, *_):
+    # ══════════════════════════════════════════
+    #  Pesquisa — só dispara no Enter/botão
+    # ══════════════════════════════════════════
+    def _trigger_search(self):
+        """Chamado pelo botão Buscar ou tecla Enter."""
         q = self._search_var.get().strip()
+
         if not q:
             state = "ready" if self.engine.total_files > 0 else "empty"
             self._placeholder(state)
             self.lbl_count.configure(text="")
             return
+
         if not q.isdigit():
             self.lbl_count.configure(text="⚠  Digite apenas números",
                                       text_color=COLORS["warning"])
-            self._placeholder("empty")
             return
-        results = self.engine.search(q)
+
+        if self._searching:
+            return  # evita buscas paralelas
+
+        # Feedback imediato na UI
+        self._searching = True
+        self.btn_search.configure(state="disabled", text="⏳ Buscando…")
+        self.lbl_count.configure(text="Pesquisando…",
+                                  text_color=COLORS["text_muted"])
+        self.lbl_status.configure(text=f"Buscando código: {q}")
+
+        # Despacha a busca para o worker thread
+        self._enqueue(self._do_search, q)
+
+    def _do_search(self, query: str):
+        """Executa no worker thread — faz a busca no índice."""
+        results = self.engine.search(query)
+        # Devolve os resultados para a thread principal
+        self.after(0, lambda r=results: self._search_done(r))
+
+    def _search_done(self, results: list[IndexEntry]):
+        """Chamado na thread principal com os resultados prontos."""
+        self._searching = False
+        self.btn_search.configure(state="normal", text="🔍  Buscar")
+
         n = len(results)
         self.lbl_count.configure(
-            text=f"{n} resultado{'s' if n != 1 else ''}",
-            text_color=COLORS["text_secondary"],
+            text=f"{n} resultado{'s' if n != 1 else ''} encontrado{'s' if n != 1 else ''}",
+            text_color=COLORS["success"] if n > 0 else COLORS["text_secondary"],
         )
+        self.lbl_status.configure(text=f"Busca concluída — {n} resultado(s)")
         self._render(results)
 
     def _clear_search(self):
         self._search_var.set("")
+        self.lbl_count.configure(text="")
+        state = "ready" if self.engine.total_files > 0 else "empty"
+        self._placeholder(state)
         self.entry_search.focus()
 
-    # ── Renderização ──────────────────────────
+    # ══════════════════════════════════════════
+    #  Renderização (thread principal)
+    # ══════════════════════════════════════════
     def _clear_scroll(self):
         for w in self.scroll.winfo_children():
             w.destroy()
@@ -534,7 +618,7 @@ class App(ctk.CTk):
             "scanning": ("⚙️",  "Indexando documentos…",
                          "Aguarde enquanto os arquivos são varridos."),
             "ready":    ("✅",  "Indexação concluída",
-                         "Digite um código numérico na barra de pesquisa."),
+                         "Digite um código e clique em Buscar ou pressione Enter."),
         }
         icon, title, sub = msgs.get(state, msgs["empty"])
         f = ctk.CTkFrame(self.scroll, fg_color="transparent")
@@ -557,32 +641,30 @@ class App(ctk.CTk):
                       self._show_folder_for_entry, i).pack(
                 fill="x", pady=(0, 1))
 
-    # ── Abrir pasta no gerenciador de arquivos ──
+    # ══════════════════════════════════════════
+    #  Abertura de arquivos
+    # ══════════════════════════════════════════
     def _show_folder_for_entry(self, entry: IndexEntry):
-        """
-        Abre o gerenciador de arquivos selecionando o arquivo.
-        - Arquivo fisico: seleciona o proprio arquivo na pasta.
-        - Arquivo ZIP: seleciona o .zip na pasta pai.
-        """
+        """Abre o gerenciador de arquivos selecionando o arquivo."""
         if entry.tipo == "ZIP":
             self._open_folder_select(entry.zip_path)
         else:
             self._open_folder_select(entry.full_path())
 
-    # ── Abertura de arquivo ───────────────────
     def _open_entry(self, entry: IndexEntry):
+        """Duplo clique — abre o arquivo diretamente."""
         if entry.tipo == "ZIP":
             self._open_folder_select(entry.zip_path)
             return
         path = entry.full_path()
         if not os.path.isfile(path):
-            messagebox.showerror("Não encontrado", f"Arquivo não existe:\n{path}")
+            messagebox.showerror("Não encontrado",
+                                 f"Arquivo não existe:\n{path}")
             return
         self._open_file_os(path)
 
     @staticmethod
     def _open_file_os(path: str):
-        """Abre um arquivo com o programa padrão do sistema."""
         try:
             sys_name = platform.system()
             if sys_name == "Windows":
@@ -595,33 +677,29 @@ class App(ctk.CTk):
             messagebox.showerror("Erro ao abrir", str(e))
 
     @staticmethod
-    def _open_folder_select(zip_path: str):
+    def _open_folder_select(target_path: str):
         """
-        Abre o gerenciador de arquivos na pasta que contém o ZIP,
-        com o arquivo ZIP selecionado (onde possível).
+        Abre o gerenciador de arquivos com o arquivo selecionado.
+        Funciona para ZIPs e arquivos físicos.
         """
-        if not zip_path or not os.path.isfile(zip_path):
+        if not target_path or not os.path.exists(target_path):
             messagebox.showerror("Não encontrado",
-                                 f"Arquivo ZIP não localizado:\n{zip_path}")
+                                 f"Caminho não localizado:\n{target_path}")
             return
         try:
             sys_name = platform.system()
             if sys_name == "Windows":
-                # Explorer exige barras invertidas e sem espaço após a vírgula
-                win_path = os.path.normpath(zip_path)
+                win_path = os.path.normpath(target_path)
                 subprocess.Popen(f'explorer /select,"{win_path}"', shell=True)
             elif sys_name == "Darwin":
-                # Finder revela e seleciona o arquivo
-                subprocess.Popen(["open", "-R", zip_path])
+                subprocess.Popen(["open", "-R", target_path])
             else:
-                # Linux: tenta abrir a pasta com o gerenciador padrão
-                pasta = os.path.dirname(zip_path)
-                # Tenta Nautilus com seleção; cai para xdg-open se não existir
+                pasta = os.path.dirname(target_path)
                 try:
-                    subprocess.Popen(["nautilus", "--select", zip_path])
+                    subprocess.Popen(["nautilus", "--select", target_path])
                 except FileNotFoundError:
                     try:
-                        subprocess.Popen(["dolphin", "--select", zip_path])
+                        subprocess.Popen(["dolphin", "--select", target_path])
                     except FileNotFoundError:
                         subprocess.Popen(["xdg-open", pasta])
         except Exception as e:
